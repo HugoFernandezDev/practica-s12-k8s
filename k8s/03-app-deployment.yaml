@@ -1,0 +1,354 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-deployment
+  namespace: practica-s12
+  labels:
+    app: db-postgres-sim
+    tier: database
+    environment: aws-cloud
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db-postgres-sim
+  template:
+    metadata:
+      labels:
+        app: db-postgres-sim
+        tier: database
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: db
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          envFrom:
+            - configMapRef:
+                name: security-configmap
+            - secretRef:
+                name: db-secret
+          command: ["python", "-Bu", "-c"]
+          args:
+            - |
+              import os, socket, threading
+
+              port = int(os.environ.get("DB_PORT", "5432"))
+              db_name = os.environ.get("DB_NAME", "cloud_security_db")
+              print(f"[DB] Iniciando servicio interno {db_name} con UID={os.getuid()} en puerto TCP {port}...", flush=True)
+
+              srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              srv.bind(("0.0.0.0", port))
+              srv.listen(32)
+
+              def handle(conn, addr):
+                  try:
+                      conn.sendall(b"OK\n")
+                  except Exception:
+                      pass
+                  finally:
+                      conn.close()
+
+              while True:
+                  c, a = srv.accept()
+                  threading.Thread(target=handle, args=(c, a), daemon=True).start()
+          ports:
+            - name: db
+              containerPort: 5432
+          readinessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp-volume
+              mountPath: /tmp
+      volumes:
+        - name: tmp-volume
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-service
+  namespace: practica-s12
+  labels:
+    app: db-postgres-sim
+    tier: database
+spec:
+  type: ClusterIP
+  selector:
+    app: db-postgres-sim
+  ports:
+    - name: db
+      protocol: TCP
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-deployment
+  namespace: practica-s12
+  labels:
+    app: cloud-sec-app
+    tier: backend
+    environment: aws-cloud
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cloud-sec-app
+  template:
+    metadata:
+      labels:
+        app: cloud-sec-app
+        tier: backend
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: cloud-sec-app
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          envFrom:
+            - configMapRef:
+                name: security-configmap
+            - secretRef:
+                name: db-secret
+          command: ["python", "-Bu", "-c"]
+          args:
+            - |
+              import http.server, json, os, socket, sys, time
+
+              APP_PORT = int(os.environ.get("APP_PORT", "8080"))
+              APP_ENV = os.environ.get("APP_ENV", "")
+              DB_HOST = os.environ.get("DB_HOST", "")
+              DB_PORT_STR = os.environ.get("DB_PORT", "")
+              DB_NAME = os.environ.get("DB_NAME", "")
+              DB_USER = os.environ.get("DB_USER", "")
+              DB_PASS = os.environ.get("DB_PASS", "")
+              SECURITY_PROFILE = os.environ.get("SECURITY_PROFILE", "")
+              INVALID_MODE = os.environ.get("INVALID_CONFIG_MODE", "")
+
+              # Escenario A: Validación de variables inyectadas desde ConfigMap y Secret
+              required = {
+                  "APP_ENV": APP_ENV,
+                  "DB_HOST": DB_HOST,
+                  "DB_PORT": DB_PORT_STR,
+                  "DB_NAME": DB_NAME,
+                  "DB_USER": DB_USER,
+                  "DB_PASS": DB_PASS,
+              }
+              missing = [k for k, v in required.items() if not v]
+              if INVALID_MODE == "CRASH" or missing or DB_PASS != "AwSk8sSecure2026!":
+                  print(
+                      f"[FATAL CONFIG ERROR] Error de inyeccion en ConfigMap/Secret: Variable critica invalida o ausente ({missing or 'DB_PASS_KEY'}).",
+                      file=sys.stderr,
+                      flush=True,
+                  )
+                  sys.exit(1)
+
+              DB_PORT = int(DB_PORT_STR)
+
+              def check_db():
+                  t0 = time.time()
+                  try:
+                      with socket.create_connection((DB_HOST, DB_PORT), timeout=2):
+                          pass
+                      return True, round((time.time() - t0) * 1000, 2), "CONECTADO Y ACTIVO"
+                  except Exception as exc:
+                      return False, None, f"ERROR: {exc}"
+
+              # Escenario B: Verificación de conectividad al puerto interno del servicio de BD
+              db_ok, latency, db_msg = False, None, ""
+              for attempt in range(5):
+                  db_ok, latency, db_msg = check_db()
+                  if db_ok:
+                      break
+                  print(f"[INFO] Esperando a {DB_HOST}:{DB_PORT} (intento {attempt + 1}/5): {db_msg}", flush=True)
+                  time.sleep(1)
+
+              if db_ok:
+                  print(f"[OK] Conectado a base de datos interna {DB_HOST}:{DB_PORT}/{DB_NAME} en {latency} ms.", flush=True)
+              else:
+                  print(f"[NET ERROR] Connection refused al intentar conectar con {DB_HOST}:{DB_PORT} ({db_msg})", file=sys.stderr, flush=True)
+
+              print(f"[SECURITY] Proceso ejecutandose como UID={os.getuid()} GID={os.getgid()} (non-root), readOnlyRootFilesystem=true", flush=True)
+              print(f"[SERVER] Escuchando en http://0.0.0.0:{APP_PORT} (/healthz, /readyz, /api/status, /)", flush=True)
+
+              class Handler(http.server.BaseHTTPRequestHandler):
+                  def log_message(self, fmt, *args):
+                      print(f"[HTTP] {self.address_string()} - {fmt % args}", flush=True)
+
+                  def _send_json(self, code, payload):
+                      body = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+                      self.send_response(code)
+                      self.send_header("Content-Type", "application/json; charset=utf-8")
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+
+                  def do_GET(self):
+                      db_connected, db_latency, db_status = check_db()
+                      pod_name = os.environ.get("HOSTNAME", socket.gethostname())
+                      status_payload = {
+                          "service": "cloud-sec-app",
+                          "status": "UP" if db_connected else "DEGRADED",
+                          "environment": APP_ENV,
+                          "pod": pod_name,
+                          "security": {
+                              "uid": os.getuid(),
+                              "gid": os.getgid(),
+                              "nonRoot": os.getuid() != 0,
+                              "securityProfile": SECURITY_PROFILE,
+                              "readOnlyRootFilesystem": True,
+                              "tmpWritable": os.access("/tmp", os.W_OK),
+                          },
+                          "database": {
+                              "host": DB_HOST,
+                              "port": DB_PORT,
+                              "name": DB_NAME,
+                              "user": DB_USER,
+                              "connected": db_connected,
+                              "latencyMs": db_latency,
+                              "detail": db_status,
+                          },
+                          "probes": {
+                              "liveness": "/healthz -> 200 OK",
+                              "readiness": f"/readyz -> {'200 OK' if db_connected else '503 ERROR'}",
+                          },
+                      }
+
+                      if self.path == "/healthz":
+                          self._send_json(200, {"status": "alive", "uid": os.getuid(), "pod": pod_name})
+                      elif self.path == "/readyz":
+                          self._send_json(200 if db_connected else 503, {
+                              "status": "ready" if db_connected else "not_ready",
+                              "dbConnected": db_connected,
+                              "dbTarget": f"{DB_HOST}:{DB_PORT}",
+                          })
+                      elif self.path == "/api/status":
+                          self._send_json(200, status_payload)
+                      else:
+                          badge_color = "#10b981" if db_connected else "#ef4444"
+                          html = f"""<!doctype html>
+              <html lang="es">
+              <head>
+                <meta charset="utf-8">
+                <title>Práctica S12 | AP9 - Cloud Security & Troubleshooting</title>
+                <style>
+                  body {{ font-family: 'Segoe UI', system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 32px; }}
+                  .container {{ max-width: 900px; margin: 0 auto; }}
+                  .header {{ background: linear-gradient(135deg, #1e293b, #0f172a); border: 1px solid #334155; border-radius: 14px; padding: 24px; margin-bottom: 20px; }}
+                  .badge {{ display: inline-block; padding: 6px 14px; border-radius: 999px; background: {badge_color}22; color: {badge_color}; border: 1px solid {badge_color}; font-weight: 700; font-size: 13px; }}
+                  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }}
+                  .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 18px; }}
+                  .card h3 {{ margin: 0 0 10px 0; color: #38bdf8; font-size: 15px; }}
+                  .kv {{ margin: 6px 0; font-size: 14px; }}
+                  .k {{ color: #94a3b8; }}
+                  code {{ background: #0f172a; padding: 2px 6px; border-radius: 4px; color: #fbbf24; }}
+                </style>
+              </head>
+              <body>
+                <div class="container">
+                  <div class="header">
+                    <span class="badge">● {status_payload['status']} — DB {db_status} ({db_latency} ms)</span>
+                    <h1 style="margin:12px 0 4px 0;">Despliegue Cloud Hardened & Troubleshooting (S12 | AP9)</h1>
+                    <p style="margin:0;color:#94a3b8;">Namespace: <code>practica-s12</code> | Pod activo: <code>{pod_name}</code></p>
+                  </div>
+                  <div class="grid">
+                    <div class="card">
+                      <h3>1. Hardening (SecurityContext)</h3>
+                      <div class="kv"><span class="k">runAsNonRoot:</span> <b>true</b></div>
+                      <div class="kv"><span class="k">UID / GID activo:</span> <code>{os.getuid()}</code> / <code>{os.getgid()}</code></div>
+                      <div class="kv"><span class="k">readOnlyRootFilesystem:</span> <b>true</b></div>
+                      <div class="kv"><span class="k">allowPrivilegeEscalation:</span> <b>false</b></div>
+                      <div class="kv"><span class="k">/tmp writable (emptyDir):</span> <b>{os.access('/tmp', os.W_OK)}</b></div>
+                    </div>
+                    <div class="card">
+                      <h3>2. Conectividad Interna DB</h3>
+                      <div class="kv"><span class="k">Host ClusterIP:</span> <code>{DB_HOST}</code></div>
+                      <div class="kv"><span class="k">Puerto interno:</span> <code>{DB_PORT}</code></div>
+                      <div class="kv"><span class="k">Base de datos:</span> <code>{DB_NAME}</code></div>
+                      <div class="kv"><span class="k">Usuario (Secret):</span> <code>{DB_USER}</code></div>
+                    </div>
+                    <div class="card">
+                      <h3>3. Sondas Liveness & Readiness</h3>
+                      <div class="kv"><span class="k">livenessProbe:</span> <code>GET /healthz:8080</code></div>
+                      <div class="kv"><span class="k">readinessProbe:</span> <code>GET /readyz:8080</code></div>
+                      <div class="kv"><span class="k">API JSON:</span> <code><a href="/api/status" style="color:#38bdf8;">/api/status</a></code></div>
+                      <div class="kv"><span class="k">Entorno:</span> <code>{APP_ENV}</code></div>
+                    </div>
+                  </div>
+                </div>
+              </body>
+              </html>""".encode("utf-8")
+                          self.send_response(200)
+                          self.send_header("Content-Type", "text/html; charset=utf-8")
+                          self.send_header("Content-Length", str(len(html)))
+                          self.end_headers()
+                          self.wfile.write(html)
+
+              server = http.server.ThreadingHTTPServer(("0.0.0.0", APP_PORT), Handler)
+              server.serve_forever()
+          ports:
+            - name: http
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp-volume
+              mountPath: /tmp
+      volumes:
+        - name: tmp-volume
+          emptyDir: {}

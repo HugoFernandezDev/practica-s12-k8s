@@ -1,0 +1,10 @@
+# Archivos locales de apoyo para entrega académica (Informe y Video)
+PLANTILLA_GOOGLE_DOCS.md
+PLANTILLA_GOOGLE_DOCS.html
+GUION_VIDEO_DEMOSTRACION.md
+
+# Temporal y sistema
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

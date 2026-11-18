@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: practica-s12
+  labels:
+    environment: aws-cloud
+    project: practica-s12
+    security: hardened

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: security-configmap
+  namespace: practica-s12
+  labels:
+    app: cloud-sec-app
+    environment: aws-cloud
+data:
+  APP_ENV: "aws-production"
+  APP_PORT: "8080"
+  DB_HOST: "db-service"
+  DB_PORT: "5432"
+  DB_NAME: "cloud_security_db"
+  SECURITY_PROFILE: "non-root-hardened"

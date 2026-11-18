@@ -1,0 +1,188 @@
+# ==============================================================================
+# MANIFIESTO CON LAS 3 FALLAS CRÍTICAS INTRODUCIDAS (ESCENARIO "ANTES")
+# Solo para reproducción de Troubleshooting (Escenarios A, B y C):
+#   - Escenario A: Mala inyección de ConfigMap/Secret (INVALID_CONFIG_MODE=CRASH y DB_PASS_KEY errónea -> CrashLoopBackOff)
+#   - Escenario B: Puerto interno de base de datos incorrecto (DB_PORT=5499 en lugar de 5432 -> Connection refused)
+#   - Escenario C: Sondas Liveness/Readiness apuntando a ruta/puerto inexistentes (/healthz-wrong:9090 -> Unhealthy)
+# ==============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-deployment
+  namespace: practica-s12
+  labels:
+    app: db-postgres-sim
+    tier: database
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db-postgres-sim
+  template:
+    metadata:
+      labels:
+        app: db-postgres-sim
+        tier: database
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: db
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: DB_PORT
+              value: "5432"
+          command: ["python", "-Bu", "-c"]
+          args:
+            - |
+              import os, socket
+              port = int(os.environ.get("DB_PORT", "5432"))
+              print(f"[DB] Escuchando en puerto interno TCP {port} (UID={os.getuid()})", flush=True)
+              srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              srv.bind(("0.0.0.0", port))
+              srv.listen(16)
+              while True:
+                  c, _ = srv.accept()
+                  c.close()
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: tmp-volume
+              mountPath: /tmp
+      volumes:
+        - name: tmp-volume
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-service
+  namespace: practica-s12
+spec:
+  type: ClusterIP
+  selector:
+    app: db-postgres-sim
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-deployment
+  namespace: practica-s12
+  labels:
+    app: cloud-sec-app
+    tier: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloud-sec-app
+  template:
+    metadata:
+      labels:
+        app: cloud-sec-app
+        tier: backend
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: cloud-sec-app
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            # FALLA ESCENARIO A: Mala inyección de ConfigMap/Secret
+            - name: INVALID_CONFIG_MODE
+              value: "CRASH"
+            - name: DB_PASS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: DB_USER # Error intencional: referencia clave incorrecta
+            # FALLA ESCENARIO B: Puerto de base de datos incorrecto (5499 != 5432)
+            - name: DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: security-configmap
+                  key: DB_HOST
+            - name: DB_PORT
+              value: "5499"
+            - name: APP_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: security-configmap
+                  key: APP_PORT
+          command: ["python", "-Bu", "-c"]
+          args:
+            - |
+              import os, socket, sys, time
+
+              db_host = os.environ.get("DB_HOST", "db-service")
+              db_port = int(os.environ.get("DB_PORT", "5499"))
+              invalid_mode = os.environ.get("INVALID_CONFIG_MODE", "")
+
+              # Registra Falla B (conectividad al puerto incorrecto)
+              try:
+                  with socket.create_connection((db_host, db_port), timeout=2):
+                      pass
+              except Exception:
+                  print(f"[NET ERROR] Connection refused al intentar conectar con {db_host}:{db_port} (Puerto interno incorrecto)", file=sys.stderr, flush=True)
+
+              # Registra Falla A (configuración / inyección de variables errónea)
+              print("[FATAL CONFIG ERROR] Error de inyeccion en ConfigMap/Secret: Variable critica DB_PASS_KEY invalida (INVALID_CONFIG_MODE=CRASH)", file=sys.stderr, flush=True)
+
+              # Espera breve para que las sondas fallen (Falla C) y luego sale con error 1 para disparar CrashLoopBackOff
+              time.sleep(8)
+              sys.exit(1)
+          ports:
+            - containerPort: 8080
+          # FALLA ESCENARIO C: Endpoints y puertos erróneos en Liveness y Readiness Probes
+          livenessProbe:
+            httpGet:
+              path: /healthz-wrong
+              port: 9090
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 1
+          readinessProbe:
+            httpGet:
+              path: /readyz-wrong
+              port: 9090
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 1
+          volumeMounts:
+            - name: tmp-volume
+              mountPath: /tmp
+      volumes:
+        - name: tmp-volume
+          emptyDir: {}
